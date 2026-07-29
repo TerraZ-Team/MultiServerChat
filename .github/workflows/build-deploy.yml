@@ -1,0 +1,111 @@
+name: Build and deploy plugin
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup .NET 9
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Build plugin
+        shell: bash
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY#*/}"
+          key() { printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -cd '[:alnum:]'; }
+          mapfile -d '' projects < <(find . -type f -name '*.csproj' -not -path '*/bin/*' -not -path '*/obj/*' -not -path '*/test/*' -not -path '*/tests/*' -not -path '*Tests*' -print0)
+
+          project=""
+          for candidate in "${projects[@]}"; do
+            if [ "$(key "$(basename "$candidate" .csproj)")" = "$(key "$repo")" ]; then
+              project="$candidate"
+              break
+            fi
+          done
+          if [ -z "$project" ] && [ "${#projects[@]}" -eq 1 ]; then project="${projects[0]}"; fi
+          if [ -z "$project" ]; then
+            printf 'Cannot determine the main project. Candidates:\n' >&2
+            printf '  %s\n' "${projects[@]}" >&2
+            exit 1
+          fi
+
+          publish="$RUNNER_TEMP/$repo-publish"
+          artifact="$RUNNER_TEMP/$repo-artifact"
+          rm -rf "$publish" "$artifact"
+          mkdir -p "$artifact"
+
+          dotnet restore "$project"
+          dotnet build "$project" --configuration Release --no-restore
+          dotnet publish "$project" --configuration Release --no-build --output "$publish"
+
+          assembly="$(dotnet msbuild "$project" -nologo -getProperty:AssemblyName | tail -n 1 | tr -d '\r')"
+          [ -n "$assembly" ] || assembly="$(basename "$project" .csproj)"
+          test -f "$publish/$assembly.dll"
+          cp "$publish/$assembly.dll" "$artifact/$assembly.dll"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ github.event.repository.name }}
+          path: ${{ runner.temp }}/${{ github.event.repository.name }}-artifact
+          if-no-files-found: error
+          retention-days: 14
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, windows, x64]
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ github.event.repository.name }}
+          path: ${{ runner.temp }}\${{ github.event.repository.name }}-artifact
+
+      - name: Deploy artifact
+        shell: pwsh
+        env:
+          DEPLOY_DIR: ${{ vars.PLUGIN_DEPLOY_DIR }}
+          REPOSITORY_NAME: ${{ github.event.repository.name }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:DEPLOY_DIR)) {
+            throw "Repository variable PLUGIN_DEPLOY_DIR is required."
+          }
+          $artifactDir = Join-Path $env:RUNNER_TEMP "$($env:REPOSITORY_NAME)-artifact"
+          $dlls = @(Get-ChildItem -LiteralPath $artifactDir -Filter "*.dll" -File)
+          if ($dlls.Count -ne 1) {
+            throw "Expected exactly one plugin DLL in artifact, found $($dlls.Count)."
+          }
+          $source = $dlls[0].FullName
+          $destination = Join-Path $env:DEPLOY_DIR $dlls[0].Name
+          New-Item -ItemType Directory -Path $env:DEPLOY_DIR -Force | Out-Null
+          if (-not (Test-Path $destination)) {
+            Copy-Item $source $destination
+          } else {
+            $bytes = [System.IO.File]::ReadAllBytes($source)
+            $stream = [System.IO.File]::Open($destination, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Write, [System.IO.FileShare]::Read)
+            try {
+              $stream.SetLength(0)
+              $stream.Write($bytes, 0, $bytes.Length)
+              $stream.Flush($true)
+            } finally {
+              $stream.Dispose()
+            }
+          }
+          Write-Host "Deployed: $destination"
