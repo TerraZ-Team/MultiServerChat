@@ -73,7 +73,7 @@ jobs:
     runs-on: [self-hosted, windows, x64]
     steps:
       - name: Download artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: ${{ github.event.repository.name }}
           path: ${{ runner.temp }}\${{ github.event.repository.name }}-artifact
@@ -85,7 +85,8 @@ jobs:
           REPOSITORY_NAME: ${{ github.event.repository.name }}
         run: |
           if ([string]::IsNullOrWhiteSpace($env:DEPLOY_DIR)) {
-            throw "Repository variable PLUGIN_DEPLOY_DIR is required."
+            $env:DEPLOY_DIR = "C:\github-deploy"
+            Write-Host "PLUGIN_DEPLOY_DIR is not set. Using default: $env:DEPLOY_DIR"
           }
           $artifactDir = Join-Path $env:RUNNER_TEMP "$($env:REPOSITORY_NAME)-artifact"
           $dlls = @(Get-ChildItem -LiteralPath $artifactDir -Filter "*.dll" -File)
